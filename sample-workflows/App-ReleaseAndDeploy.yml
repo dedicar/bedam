@@ -1,0 +1,240 @@
+name: .NET 8 Release Build, Publish & Deploy to Azure Function App
+
+on:
+  push:
+    branches:
+      - dev
+      - pre-release
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  PUBLISH_DIR: './publish_output'
+  HEALTHCHECK_URL_DEV: 'https://dev-func-app.azurewebsites.net/api/health'
+  HEALTHCHECK_URL_TEST: 'https://test-func-app.azurewebsites.net/api/health'
+  HEALTHCHECK_URL_STAGE: 'https://stage-func-app.azurewebsites.net/api/health'
+  HEALTHCHECK_URL_PROD: 'https://prod-func-app.azurewebsites.net/api/health'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-publish:
+    runs-on: windows-latest
+    outputs:
+      publish_dir: ${{ steps.set-publish-dir.outputs.publish_dir }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build (Release)
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Publish for Azure Functions
+        run: dotnet publish --configuration Release --output ${{ env.PUBLISH_DIR }}
+
+      - name: Set publish dir output
+        id: set-publish-dir
+        run: echo "publish_dir=${{ env.PUBLISH_DIR }}" >> $GITHUB_OUTPUT
+
+  deploy-dev:
+    needs: build-publish
+    if: github.ref == 'refs/heads/dev'
+    runs-on: windows-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_DEV }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID_DEV }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_DEV }}
+
+      - name: Deploy to Azure Function App (Dev)
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ secrets.AZURE_FUNCTIONAPP_NAME_DEV }}
+          package: ${{ env.PUBLISH_DIR }}
+          # Using federated credentials, no publish-profile needed
+
+      - name: Health Check (Dev)
+        id: healthcheck
+        run: |
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ env.HEALTHCHECK_URL_DEV }}")
+            if [ "$STATUS" -eq 200 ]; then
+              echo "Health check passed."
+              exit 0
+            fi
+            echo "Health check failed (status: $STATUS), retrying in 10s..."
+            sleep 10
+          done
+          echo "Health check failed after retries."
+          exit 1
+
+      - name: Rollback Deployment (Dev)
+        if: failure() && steps.healthcheck.outcome == 'failure'
+        run: |
+          echo "Rolling back to previous deployment for Dev..."
+          az functionapp deployment slot swap --name ${{ secrets.AZURE_FUNCTIONAPP_NAME_DEV }} --resource-group ${{ secrets.AZURE_FUNCTIONAPP_RESOURCE_GROUP_DEV }} --slot previous --target-slot production
+
+  deploy-test:
+    needs: build-publish
+    if: github.ref == 'refs/heads/pre-release'
+    runs-on: windows-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_TEST }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID_TEST }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_TEST }}
+
+      - name: Deploy to Azure Function App (Test)
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ secrets.AZURE_FUNCTIONAPP_NAME_TEST }}
+          package: ${{ env.PUBLISH_DIR }}
+          # Using federated credentials, no publish-profile needed
+
+      - name: Health Check (Test)
+        id: healthcheck
+        run: |
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ env.HEALTHCHECK_URL_TEST }}")
+            if [ "$STATUS" -eq 200 ]; then
+              echo "Health check passed."
+              exit 0
+            fi
+            echo "Health check failed (status: $STATUS), retrying in 10s..."
+            sleep 10
+          done
+          echo "Health check failed after retries."
+          exit 1
+
+      - name: Rollback Deployment (Test)
+        if: failure() && steps.healthcheck.outcome == 'failure'
+        run: |
+          echo "Rolling back to previous deployment for Test..."
+          az functionapp deployment slot swap --name ${{ secrets.AZURE_FUNCTIONAPP_NAME_TEST }} --resource-group ${{ secrets.AZURE_FUNCTIONAPP_RESOURCE_GROUP_TEST }} --slot previous --target-slot production
+
+  deploy-stage:
+    needs: build-publish
+    if: github.ref == 'refs/heads/pre-release'
+    runs-on: windows-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_STAGE }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID_STAGE }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_STAGE }}
+
+      - name: Deploy to Azure Function App (Stage)
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ secrets.AZURE_FUNCTIONAPP_NAME_STAGE }}
+          package: ${{ env.PUBLISH_DIR }}
+          # Using federated credentials, no publish-profile needed
+
+      - name: Health Check (Stage)
+        id: healthcheck
+        run: |
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ env.HEALTHCHECK_URL_STAGE }}")
+            if [ "$STATUS" -eq 200 ]; then
+              echo "Health check passed."
+              exit 0
+            fi
+            echo "Health check failed (status: $STATUS), retrying in 10s..."
+            sleep 10
+          done
+          echo "Health check failed after retries."
+          exit 1
+
+      - name: Rollback Deployment (Stage)
+        if: failure() && steps.healthcheck.outcome == 'failure'
+        run: |
+          echo "Rolling back to previous deployment for Stage..."
+          az functionapp deployment slot swap --name ${{ secrets.AZURE_FUNCTIONAPP_NAME_STAGE }} --resource-group ${{ secrets.AZURE_FUNCTIONAPP_RESOURCE_GROUP_STAGE }} --slot previous --target-slot production
+
+  prod-approval:
+    needs: build-publish
+    if: github.ref == 'refs/heads/pre-release'
+    runs-on: windows-latest
+    environment:
+      name: prod
+      reviewers:
+        - approver1
+        - approver2
+        - approver3
+    timeout-minutes: 180
+    steps:
+      - name: Await manual approval before production deployment
+        run: echo "Awaiting approval from one of the designated approvers before deploying to production. This will timeout in 3 hours if not approved."
+
+  deploy-prod:
+    needs: [build-publish, prod-approval]
+    if: github.ref == 'refs/heads/pre-release'
+    runs-on: windows-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Azure Login (OIDC)
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_PROD }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID_PROD }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}
+
+      - name: Deploy to Azure Function App (Prod)
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ secrets.AZURE_FUNCTIONAPP_NAME_PROD }}
+          package: ${{ env.PUBLISH_DIR }}
+          # Using federated credentials, no publish-profile needed
+
+      - name: Health Check (Prod)
+        id: healthcheck
+        run: |
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ env.HEALTHCHECK_URL_PROD }}")
+            if [ "$STATUS" -eq 200 ]; then
+              echo "Health check passed."
+              exit 0
+            fi
+            echo "Health check failed (status: $STATUS), retrying in 10s..."
+            sleep 10
+          done
+          echo "Health check failed after retries."
+          exit 1
+
+      - name: Rollback Deployment (Prod)
+        if: failure() && steps.healthcheck.outcome == 'failure'
+        run: |
+          echo "Rolling back to previous deployment for Prod..."
+          az functionapp deployment slot swap --name ${{ secrets.AZURE_FUNCTIONAPP_NAME_PROD }} --resource-group ${{ secrets.AZURE_FUNCTIONAPP_RESOURCE_GROUP_PROD }} --slot previous --target-slot production
+
+
+
+
+
+
+

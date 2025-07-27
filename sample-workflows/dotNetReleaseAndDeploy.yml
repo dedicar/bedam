@@ -1,0 +1,206 @@
+name: .NET 8 Release Build, Publish & Deploy to Azure Function App(s)
+
+on:
+  push:
+    branches:
+      - dev
+      - test
+      - stage
+      - main
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  PUBLISH_DIR: './publish_output'
+
+jobs:
+  build-publish:
+    runs-on: windows-latest
+    outputs:
+      publish_dir: ${{ steps.set-publish-dir.outputs.publish_dir }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET ${{ env.DOTNET_VERSION }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build (Release)
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Publish for Azure Functions
+        run: dotnet publish --configuration Release --output ${{ env.PUBLISH_DIR }}
+
+      - name: Set publish dir output
+        id: set-publish-dir
+        run: echo "publish_dir=${{ env.PUBLISH_DIR }}" >> $GITHUB_OUTPUT
+
+  deploy-dev:
+    needs: build-publish
+    if: github.ref == 'refs/heads/dev'
+    runs-on: windows-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build-publish.outputs.publish_dir }}
+          path: ${{ needs.build-publish.outputs.publish_dir }}
+
+      - name: Deploy to Azure Dev Function App
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ secrets.AZURE_FUNCTIONAPP_DEV_NAME }}
+          package: ${{ needs.build-publish.outputs.publish_dir }}
+          publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_DEV_PUBLISH_PROFILE }}
+
+      - name: Health Check Dev Function App
+        run: |
+          echo "Checking health of Dev Function App..."
+          for i in {1..5}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ secrets.AZURE_FUNCTIONAPP_DEV_HEALTHCHECK_URL }}")
+            if [ "$STATUS" = "200" ]; then
+              echo "Health check passed."
+              exit 0
+            fi
+            echo "Health check failed (status: $STATUS), retrying in 10s..."
+            sleep 10
+          done
+          echo "Health check failed after retries."
+          exit 1
+
+  deploy-test:
+    needs: build-publish
+    if: github.ref == 'refs/heads/test'
+    runs-on: windows-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build-publish.outputs.publish_dir }}
+          path: ${{ needs.build-publish.outputs.publish_dir }}
+
+      - name: Deploy to Azure Test Function App
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ secrets.AZURE_FUNCTIONAPP_TEST_NAME }}
+          package: ${{ needs.build-publish.outputs.publish_dir }}
+          publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_TEST_PUBLISH_PROFILE }}
+
+      - name: Health Check Test Function App
+        run: |
+          echo "Checking health of Test Function App..."
+          for i in {1..5}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ secrets.AZURE_FUNCTIONAPP_TEST_HEALTHCHECK_URL }}")
+            if [ "$STATUS" = "200" ]; then
+              echo "Health check passed."
+              exit 0
+            fi
+            echo "Health check failed (status: $STATUS), retrying in 10s..."
+            sleep 10
+          done
+          echo "Health check failed after retries."
+          exit 1
+
+  deploy-stage:
+    needs: build-publish
+    if: github.ref == 'refs/heads/stage'
+    runs-on: windows-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build-publish.outputs.publish_dir }}
+          path: ${{ needs.build-publish.outputs.publish_dir }}
+
+      - name: Deploy to Azure Stage Function App
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ secrets.AZURE_FUNCTIONAPP_STAGE_NAME }}
+          package: ${{ needs.build-publish.outputs.publish_dir }}
+          publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_STAGE_PUBLISH_PROFILE }}
+
+      - name: Health Check Stage Function App
+        run: |
+          echo "Checking health of Stage Function App..."
+          for i in {1..5}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ secrets.AZURE_FUNCTIONAPP_STAGE_HEALTHCHECK_URL }}")
+            if [ "$STATUS" = "200" ]; then
+              echo "Health check passed."
+              exit 0
+            fi
+            echo "Health check failed (status: $STATUS), retrying in 10s..."
+            sleep 10
+          done
+          echo "Health check failed after retries."
+          exit 1
+
+  prod-approval:
+    needs: build-publish
+    if: github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    outputs:
+      approved: ${{ steps.approval.outputs.approved }}
+    steps:
+      - name: Await User Approval for Production Deployment
+        id: approval
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ secrets.GITHUB_TOKEN }}
+          approvers: user1,user2,user3
+          minimum-approvals: 1
+          issue-title: "Production Deployment Approval Required"
+          issue-body: "Please approve the deployment to the Production Azure Function App. Approval from any one of the three approvers (user1, user2, user3) is sufficient."
+          exclude-workflow-initiator-as-approver: false
+
+  deploy-prod:
+    needs: [build-publish, prod-approval]
+    if: github.ref == 'refs/heads/main' && needs.prod-approval.outputs.approved == 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build-publish.outputs.publish_dir }}
+          path: ${{ needs.build-publish.outputs.publish_dir }}
+
+      - name: Backup current production deployment (swap to 'previous' slot)
+        run: |
+          az login --service-principal -u ${{ secrets.AZURE_CLIENT_ID }} -p ${{ secrets.AZURE_CLIENT_SECRET }} --tenant ${{ secrets.AZURE_TENANT_ID }}
+          az functionapp deployment slot create --name ${{ secrets.AZURE_FUNCTIONAPP_PROD_NAME }} --resource-group ${{ secrets.AZURE_FUNCTIONAPP_PROD_RG }} --slot previous || true
+          az functionapp deployment slot swap --name ${{ secrets.AZURE_FUNCTIONAPP_PROD_NAME }} --resource-group ${{ secrets.AZURE_FUNCTIONAPP_PROD_RG }} --slot previous --target-slot production || true
+
+      - name: Deploy to Azure Production Function App
+        id: deploy_prod
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ secrets.AZURE_FUNCTIONAPP_PROD_NAME }}
+          package: ${{ needs.build-publish.outputs.publish_dir }}
+          publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PROD_PUBLISH_PROFILE }}
+
+      - name: Health Check Production Function App
+        id: healthcheck_prod
+        run: |
+          echo "Checking health of Production Function App..."
+          for i in {1..5}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ secrets.AZURE_FUNCTIONAPP_PROD_HEALTHCHECK_URL }}")
+            if [ "$STATUS" = "200" ]; then
+              echo "Health check passed."
+              exit 0
+            fi
+            echo "Health check failed (status: $STATUS), retrying in 10s..."
+            sleep 10
+          done
+          echo "Health check failed after retries."
+          exit 1
+
+      - name: Rollback Production Function App if Health Check Fails
+        if: failure()
+        run: |
+          echo "Production deployment or health check failed. Initiating rollback to previous deployment..."
+          az login --service-principal -u ${{ secrets.AZURE_CLIENT_ID }} -p ${{ secrets.AZURE_CLIENT_SECRET }} --tenant ${{ secrets.AZURE_TENANT_ID }}
+          az functionapp deployment slot swap --name ${{ secrets.AZURE_FUNCTIONAPP_PROD_NAME }} --resource-group ${{ secrets.AZURE_FUNCTIONAPP_PROD_RG }} --slot previous --target-slot production
+          echo "Rollback completed."
