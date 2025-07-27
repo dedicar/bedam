@@ -1,0 +1,356 @@
+name: .NET 8 Azure Function App Release and Deploy
+
+on:
+  push:
+    branches:
+      - dev
+      - pre-release
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  BUILD_CONFIGURATION: 'Release'
+  ARTIFACT_NAME: 'drop'
+  PUBLISH_DIR: '$(System.DefaultWorkingDirectory)/publish_output'
+  HEALTHCHECK_URL_DEV: ${{ secrets.HEALTHCHECK_URL_DEV }}
+  HEALTHCHECK_URL_TEST: ${{ secrets.HEALTHCHECK_URL_TEST }}
+  HEALTHCHECK_URL_STAGE: ${{ secrets.HEALTHCHECK_URL_STAGE }}
+  HEALTHCHECK_URL_PROD: ${{ secrets.HEALTHCHECK_URL_PROD }}
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-publish:
+    name: Build and Publish
+    runs-on: xyz-runner
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Restore NuGet packages
+        run: dotnet restore
+
+      - name: Check for .NET Isolated Worker Function App
+        shell: bash
+        run: |
+          echo "Checking for .NET Isolated Function App projects..."
+          found=0
+          for csproj in $(find . -name '*.csproj'); do
+            if grep -q '<AzureFunctionsVersion>v4</AzureFunctionsVersion>' "$csproj" && grep -q '<OutputType>Exe</OutputType>' "$csproj"; then
+              if grep -q 'Microsoft.Azure.Functions.Worker' "$csproj"; then
+                echo "Isolated worker function app detected: $csproj"
+                found=1
+              fi
+            fi
+          done
+          if [ $found -eq 0 ]; then
+            echo "::error::No .NET Isolated worker Azure Function App project detected!"
+            exit 1
+          fi
+
+      - name: Build Azure Function App (Isolated)
+        run: dotnet build --configuration ${{ env.BUILD_CONFIGURATION }} -nowarn:CS0618
+
+      - name: Test Azure Function App (Isolated)
+        run: dotnet test --configuration ${{ env.BUILD_CONFIGURATION }} --no-build --collect:"XPlat Code Coverage"
+
+      - name: Publish Azure Function App
+        run: dotnet publish --configuration ${{ env.BUILD_CONFIGURATION }} --output ${{ env.PUBLISH_DIR }}
+
+      - name: Upload artifact for deployment
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.PUBLISH_DIR }}
+
+  deploy-dev:
+    name: Deploy to Azure Function App (Dev)
+    needs: build-publish
+    if: github.ref == 'refs/heads/dev'
+    runs-on: xyz-runner
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.PUBLISH_DIR }}
+
+      - name: Enable Federated Identity Credential for Azure Login (Dev)
+        run: |
+          echo "Ensure that the Azure AD App Registration for the DEV environment has a Federated Identity Credential configured for this GitHub repository and branch."
+          echo "See: https://learn.microsoft.com/en-us/azure/active-directory/develop/workload-identity-federation-create-trust-github?tabs=azure-portal"
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_DEV }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID_DEV }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_DEV }}
+
+      - name: Deploy to Azure Function App (Dev)
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ secrets.AZURE_FUNCTIONAPP_NAME_DEV }}
+          package: ${{ env.PUBLISH_DIR }}
+
+      - name: Quick Health Check (Dev)
+        id: healthcheck
+        continue-on-error: true
+        run: |
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ env.HEALTHCHECK_URL_DEV }}")
+            if [ "$STATUS" -eq 200 ]; then
+              echo "Health check passed."
+              echo "status=success" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Health check failed (status: $STATUS), retrying in 10s..."
+            sleep 10
+          done
+          echo "Health check failed after retries."
+          echo "status=failure" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Report Health Check Status (Dev)
+        if: always()
+        run: |
+          if [ "${{ steps.healthcheck.outcome }}" = "success" ]; then
+            echo "✅ Health check succeeded for Dev environment."
+          else
+            echo "❌ Health check failed for Dev environment. Please investigate."
+          fi
+
+      - name: Handle Health Check Failure Gracefully (Dev)
+        if: failure() && steps.healthcheck.outcome == 'failure'
+        run: |
+          echo "Deployment succeeded but health check failed. Please check the application logs and investigate the issue."
+          # Optionally, trigger rollback or alert here
+
+  deploy-test:
+    name: Deploy to Azure Function App (Test)
+    needs: build-publish
+    if: github.ref == 'refs/heads/pre-release'
+    runs-on: xyz-runner
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.PUBLISH_DIR }}
+
+      - name: Enable Federated Identity Credential for Azure Login (Test)
+        run: |
+          echo "Ensure that the Azure AD App Registration for the TEST environment has a Federated Identity Credential configured for this GitHub repository and branch."
+          echo "See: https://learn.microsoft.com/en-us/azure/active-directory/develop/workload-identity-federation-create-trust-github?tabs=azure-portal"
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_TEST }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID_TEST }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_TEST }}
+
+      - name: Deploy to Azure Function App (Test)
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ secrets.AZURE_FUNCTIONAPP_NAME_TEST }}
+          package: ${{ env.PUBLISH_DIR }}
+
+      - name: Quick Health Check (Test)
+        id: healthcheck
+        continue-on-error: true
+        run: |
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ env.HEALTHCHECK_URL_TEST }}")
+            if [ "$STATUS" -eq 200 ]; then
+              echo "Health check passed."
+              echo "status=success" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Health check failed (status: $STATUS), retrying in 10s..."
+            sleep 10
+          done
+          echo "Health check failed after retries."
+          echo "status=failure" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Report Health Check Status (Test)
+        if: always()
+        run: |
+          if [ "${{ steps.healthcheck.outcome }}" = "success" ]; then
+            echo "✅ Health check succeeded for Test environment."
+          else
+            echo "❌ Health check failed for Test environment. Please investigate."
+          fi
+
+      - name: Handle Health Check Failure Gracefully (Test)
+        if: failure() && steps.healthcheck.outcome == 'failure'
+        run: |
+          echo "Deployment succeeded but health check failed. Please check the application logs and investigate the issue."
+          # Optionally, trigger rollback or alert here
+
+  deploy-stage:
+    name: Deploy to Azure Function App (Stage)
+    needs: build-publish
+    if: github.ref == 'refs/heads/pre-release'
+    runs-on: xyz-runner
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.PUBLISH_DIR }}
+
+      - name: Enable Federated Identity Credential for Azure Login (Stage)
+        run: |
+          echo "Ensure that the Azure AD App Registration for the STAGE environment has a Federated Identity Credential configured for this GitHub repository and branch."
+          echo "See: https://learn.microsoft.com/en-us/azure/active-directory/develop/workload-identity-federation-create-trust-github?tabs=azure-portal"
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_STAGE }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID_STAGE }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_STAGE }}
+
+      - name: Deploy to Azure Function App (Stage)
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ secrets.AZURE_FUNCTIONAPP_NAME_STAGE }}
+          package: ${{ env.PUBLISH_DIR }}
+
+      - name: Quick Health Check (Stage)
+        id: healthcheck
+        continue-on-error: true
+        run: |
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ env.HEALTHCHECK_URL_STAGE }}")
+            if [ "$STATUS" -eq 200 ]; then
+              echo "Health check passed."
+              echo "status=success" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Health check failed (status: $STATUS), retrying in 10s..."
+            sleep 10
+          done
+          echo "Health check failed after retries."
+          echo "status=failure" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Report Health Check Status (Stage)
+        if: always()
+        run: |
+          if [ "${{ steps.healthcheck.outcome }}" = "success" ]; then
+            echo "✅ Health check succeeded for Stage environment."
+          else
+            echo "❌ Health check failed for Stage environment. Please investigate."
+          fi
+
+      - name: Handle Health Check Failure Gracefully (Stage)
+        if: failure() && steps.healthcheck.outcome == 'failure'
+        run: |
+          echo "Deployment succeeded but health check failed. Please check the application logs and investigate the issue."
+          # Optionally, trigger rollback or alert here
+
+  prod-approval:
+    name: Await Manual Approval for Production
+    needs: build-publish
+    if: github.ref == 'refs/heads/pre-release'
+    runs-on: xyz-runner
+    environment:
+      name: production
+    timeout-minutes: 180
+    steps:
+      - name: Await manual approval before production deployment
+        uses: trstringer/manual-approval@v1
+        with:
+          secret: ${{ github.token }}
+          approvers: |
+            approver1
+            approver2
+            approver3
+          minimum-approvals: 1
+          issue-title: "Production Deployment Approval Required"
+          issue-body: "Please approve this production deployment. Only one approval is required from the list of approvers."
+          timeout-minutes: 180
+
+  deploy-prod:
+    name: Deploy to Azure Function App (Prod)
+    needs: [build-publish, prod-approval]
+    if: github.ref == 'refs/heads/pre-release'
+    runs-on: xyz-runner
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v3
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.PUBLISH_DIR }}
+
+      - name: Enable Federated Identity Credential for Azure Login (Prod)
+        run: |
+          echo "Ensure that the Azure AD App Registration for the PROD environment has a Federated Identity Credential configured for this GitHub repository and branch."
+          echo "See: https://learn.microsoft.com/en-us/azure/active-directory/develop/workload-identity-federation-create-trust-github?tabs=azure-portal"
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_PROD }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID_PROD }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}
+
+      - name: Deploy to Azure Function App (Prod)
+        uses: Azure/functions-action@v1
+        with:
+          app-name: ${{ secrets.AZURE_FUNCTIONAPP_NAME_PROD }}
+          package: ${{ env.PUBLISH_DIR }}
+
+      - name: Quick Health Check (Prod)
+        id: healthcheck
+        continue-on-error: true
+        run: |
+          for i in {1..10}; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${{ env.HEALTHCHECK_URL_PROD }}")
+            if [ "$STATUS" -eq 200 ]; then
+              echo "Health check passed."
+              echo "status=success" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            echo "Health check failed (status: $STATUS), retrying in 10s..."
+            sleep 10
+          done
+          echo "Health check failed after retries."
+          echo "status=failure" >> $GITHUB_OUTPUT
+          exit 1
+
+      - name: Report Health Check Status (Prod)
+        if: always()
+        run: |
+          if [ "${{ steps.healthcheck.outcome }}" = "success" ]; then
+            echo "✅ Health check succeeded for Prod environment."
+          else
+            echo "❌ Health check failed for Prod environment. Please investigate."
+          fi
+
+      - name: Handle Health Check Failure Gracefully (Prod)
+        if: failure() && steps.healthcheck.outcome == 'failure'
+        run: |
+          echo "Deployment succeeded but health check failed. Please check the application logs and investigate the issue."
+          # Optionally, trigger rollback or alert here

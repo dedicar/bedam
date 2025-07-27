@@ -1,0 +1,70 @@
+trigger:
+  branches:
+    include:
+      - '*'
+
+pr:
+  branches:
+    include:
+      - '*'
+
+pool:
+  name: 'xyz-runner'
+
+variables:
+  buildConfiguration: 'Release'
+  dotnetVersion: '8.0.x'
+
+stages:
+- stage: BuildAndTest
+  displayName: 'Build and Test Azure Function App on PR'
+  jobs:
+  - job: BuildAndTest
+    displayName: 'Build and Test .NET 8 Azure Function App (Isolated)'
+    pool:
+      name: 'xyz-runner'
+    steps:
+    - task: UseDotNet@2
+      displayName: 'Install .NET SDK'
+      inputs:
+        packageType: 'sdk'
+        version: '$(dotnetVersion)'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Restore NuGet packages'
+      inputs:
+        command: 'restore'
+        projects: '**/*.csproj'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Build Azure Function App (Isolated)'
+      inputs:
+        command: 'build'
+        projects: '**/*.csproj'
+        arguments: '--configuration $(buildConfiguration) -nowarn:CS0618'
+
+    - script: |
+        echo "Checking for .NET Isolated Function App projects..."
+        found=0
+        for csproj in $(find . -name '*.csproj'); do
+          if grep -q '<AzureFunctionsVersion>v4</AzureFunctionsVersion>' "$csproj" && grep -q '<OutputType>Exe</OutputType>' "$csproj"; then
+            if grep -q 'Microsoft.Azure.Functions.Worker' "$csproj"; then
+              echo "Isolated worker function app detected: $csproj"
+              found=1
+            fi
+          fi
+        done
+        if [ $found -eq 0 ]; then
+          echo "##vso[task.logissue type=error]No .NET Isolated worker Azure Function App project detected!"
+          exit 1
+        fi
+      displayName: 'Check for .NET Isolated Worker Function App'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Test Azure Function App (Isolated)'
+      inputs:
+        command: 'test'
+        projects: '**/*[Tt]ests/*.csproj'
+        arguments: '--configuration $(buildConfiguration) --no-build --collect:"XPlat Code Coverage"'
+
+
