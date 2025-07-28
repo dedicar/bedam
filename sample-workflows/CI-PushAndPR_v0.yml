@@ -1,0 +1,74 @@
+name: CI - Push and PR
+
+on:
+  push:
+    branches:
+      - dev
+      - pre-release
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches:
+      - dev
+      - pre-release
+  workflow_dispatch:
+
+env:
+  NUGET_URL: ${{ secrets.ARTIFACTORY_URL }}
+  NUGET_USER: ${{ secrets.ARTIFACTORY_USERNAME }}
+  NUGET_PASSWORD: ${{ secrets.ARTIFACTORY_API_KEY }}
+
+jobs:
+  build-and-test:
+    runs-on: xyz-runner
+
+    defaults:
+      run:
+        shell: bash
+        working-directory: .
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+          cache: true
+
+      - name: Configure Artifactory NuGet source
+        run: |
+          dotnet nuget remove source artifactory &>/dev/null || true
+          dotnet nuget add source "$NUGET_URL" \
+            --name artifactory \
+            --username "$NUGET_USER" \
+            --password "$NUGET_PASSWORD" \
+            --store-password-in-clear-text
+
+      - name: Restore dependencies
+        run: dotnet restore --verbosity minimal
+
+      - name: Build solution
+        run: dotnet build --no-restore --configuration Release --verbosity minimal
+
+      - name: Run tests (continue on failure)
+        id: test
+        continue-on-error: true
+        run: |
+          dotnet test --no-build --configuration Release --verbosity normal
+
+      - name: Report test outcome
+        if: always()
+        run: |
+          if [ "${{ steps.test.outcome }}" = "failure" ]; then
+            echo "⚠️ Some tests failed. Please review the logs above."
+          else
+            echo "✅ All tests passed."
+          fi
+
+      - name: Clean up Artifactory credentials
+        if: always()
+        run: |
+          dotnet nuget remove source artifactory &>/dev/null || true

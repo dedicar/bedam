@@ -1,0 +1,185 @@
+name: CD - Azure Function App
+
+on:
+  workflow_dispatch:
+    inputs:
+      environments:
+        description: 'Select one or more environments to deploy to (dev, test, stage, prod)'
+        required: true
+        type: multiselect
+        options:
+          - dev
+          - test
+          - stage
+          - prod
+  push:
+    branches:
+      - dev
+      - pre-release
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  NUGET_URL: ${{ secrets.ARTIFACTORY_URL }}
+  NUGET_USER: ${{ secrets.ARTIFACTORY_USERNAME }}
+  NUGET_PASSWORD: ${{ secrets.ARTIFACTORY_API_KEY }}
+  PACKAGE_PATH: './publish'
+  HEALTH_CHECK_URL_DEV: 'https://dev-your-func-app.azurewebsites.net/api/health'
+  HEALTH_CHECK_URL_TEST: 'https://test-your-func-app.azurewebsites.net/api/health'
+  HEALTH_CHECK_URL_STAGE: 'https://stage-your-func-app.azurewebsites.net/api/health'
+  HEALTH_CHECK_URL_PROD: 'https://prod-your-func-app.azurewebsites.net/api/health'
+  REVIEWER_EMAILS: 'approver1@example.com,approver2@example.com,approver3@example.com'
+
+jobs:
+  build:
+    name: Build and Publish
+    runs-on: ubuntu-latest
+    outputs:
+      package-path: ${{ steps.set-package-path.outputs.package-path }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+          cache: true
+
+      - name: Configure Artifactory NuGet source
+        run: |
+          dotnet nuget remove source artifactory &>/dev/null || true
+          dotnet nuget add source "$NUGET_URL" \
+            --name artifactory \
+            --username "$NUGET_USER" \
+            --password "$NUGET_PASSWORD" \
+            --store-password-in-clear-text
+
+      - name: Restore dependencies
+        run: dotnet restore --verbosity minimal
+
+      - name: Build solution
+        run: dotnet build --no-restore --configuration Release --verbosity minimal
+
+      - name: Publish Function App
+        run: |
+          dotnet publish --no-build --configuration Release --output $PACKAGE_PATH
+
+      - name: Set package path output
+        id: set-package-path
+        run: echo "package-path=$PACKAGE_PATH" >> $GITHUB_OUTPUT
+
+      - name: Clean up Artifactory credentials
+        if: always()
+        run: |
+          dotnet nuget remove source artifactory &>/dev/null || true
+
+  deploy:
+    name: Deploy to Azure Function App
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, test, stage, prod]
+    if: |
+      (github.event_name == 'workflow_dispatch' && contains(github.event.inputs.environments, matrix.environment)) ||
+      (github.event_name == 'push' && (
+        (github.ref == 'refs/heads/dev' && matrix.environment == 'dev') ||
+        (github.ref == 'refs/heads/pre-release' && matrix.environment != 'dev')
+      ))
+    environment: ${{ matrix.environment }}
+
+    steps:
+      - name: Validate branch and environment selection
+        run: |
+          BRANCH="${GITHUB_REF##*/}"
+          ENV="${{ matrix.environment }}"
+          if [[ "$BRANCH" == "dev" && "$ENV" != "dev" ]]; then
+            echo "❌ 'dev' branch can only deploy to 'dev' environment."
+            exit 1
+          fi
+          if [[ "$BRANCH" == "pre-release" && "$ENV" == "dev" ]]; then
+            echo "❌ 'pre-release' branch cannot deploy to 'dev' environment."
+            exit 1
+          fi
+
+      - name: Set environment variables for deployment
+        id: set-env
+        run: |
+          ENV="${{ matrix.environment }}"
+          if [[ "$ENV" == "dev" ]]; then
+            echo "AZURE_FUNCTIONAPP_NAME=${{ secrets.AZURE_FUNCTIONAPP_NAME_DEV }}" >> $GITHUB_ENV
+            echo "AZURE_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID_NONPROD }}" >> $GITHUB_ENV
+            echo "AZURE_TENANT_ID=${{ secrets.AZURE_TENANT_ID_NONPROD }}" >> $GITHUB_ENV
+            echo "AZURE_SUBSCRIPTION_ID=${{ secrets.AZURE_SUBSCRIPTION_ID_NONPROD }}" >> $GITHUB_ENV
+            echo "HEALTH_CHECK_URL=${{ env.HEALTH_CHECK_URL_DEV }}" >> $GITHUB_ENV
+          elif [[ "$ENV" == "test" ]]; then
+            echo "AZURE_FUNCTIONAPP_NAME=${{ secrets.AZURE_FUNCTIONAPP_NAME_TEST }}" >> $GITHUB_ENV
+            echo "AZURE_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID_NONPROD }}" >> $GITHUB_ENV
+            echo "AZURE_TENANT_ID=${{ secrets.AZURE_TENANT_ID_NONPROD }}" >> $GITHUB_ENV
+            echo "AZURE_SUBSCRIPTION_ID=${{ secrets.AZURE_SUBSCRIPTION_ID_NONPROD }}" >> $GITHUB_ENV
+            echo "HEALTH_CHECK_URL=${{ env.HEALTH_CHECK_URL_TEST }}" >> $GITHUB_ENV
+          elif [[ "$ENV" == "stage" ]]; then
+            echo "AZURE_FUNCTIONAPP_NAME=${{ secrets.AZURE_FUNCTIONAPP_NAME_STAGE }}" >> $GITHUB_ENV
+            echo "AZURE_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID_NONPROD }}" >> $GITHUB_ENV
+            echo "AZURE_TENANT_ID=${{ secrets.AZURE_TENANT_ID_NONPROD }}" >> $GITHUB_ENV
+            echo "AZURE_SUBSCRIPTION_ID=${{ secrets.AZURE_SUBSCRIPTION_ID_NONPROD }}" >> $GITHUB_ENV
+            echo "HEALTH_CHECK_URL=${{ env.HEALTH_CHECK_URL_STAGE }}" >> $GITHUB_ENV
+          elif [[ "$ENV" == "prod" ]]; then
+            echo "AZURE_FUNCTIONAPP_NAME=${{ secrets.AZURE_FUNCTIONAPP_NAME_PROD }}" >> $GITHUB_ENV
+            echo "AZURE_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID_PROD }}" >> $GITHUB_ENV
+            echo "AZURE_TENANT_ID=${{ secrets.AZURE_TENANT_ID_PROD }}" >> $GITHUB_ENV
+            echo "AZURE_SUBSCRIPTION_ID=${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}" >> $GITHUB_ENV
+            echo "HEALTH_CHECK_URL=${{ env.HEALTH_CHECK_URL_PROD }}" >> $GITHUB_ENV
+          fi
+
+      - name: Pre-Deployment Approval (Stage/Prod)
+        if: matrix.environment == 'stage' || matrix.environment == 'prod'
+        uses: trstringer/manual-approval@v1
+        with:
+          approvers: approver1,approver2,approver3
+          minimum-approvals: 1
+          timeout-minutes: 180
+          issue-title: "Pre-Deployment Approval Required for ${{ matrix.environment | upper }}"
+          issue-body: "Please approve the deployment to the ${{ matrix.environment }} environment for this workflow run. This approval will be awaited for up to 3 hours. If not approved within this time, the deployment will be cancelled."
+          exclude-workflow-initiator-as-approver: false
+
+      - name: Azure Login (Federated OIDC)
+        uses: azure/login@v1
+        with:
+          client-id: ${{ env.AZURE_CLIENT_ID }}
+          tenant-id: ${{ env.AZURE_TENANT_ID }}
+          subscription-id: ${{ env.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy to Azure Function App (${{ matrix.environment }})
+        uses: azure/functions-action@v1
+        with:
+          app-name: ${{ env.AZURE_FUNCTIONAPP_NAME }}
+          package: ${{ needs.build.outputs.package-path }}
+
+      - name: Health Check (${{ matrix.environment }})
+        env:
+          HEALTH_CHECK_URL: ${{ env.HEALTH_CHECK_URL }}
+        run: |
+          for i in {1..10}; do
+            status=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_CHECK_URL" || echo "000")
+            if [ "$status" = "200" ]; then
+              echo "✅ Health check passed."
+              exit 0
+            else
+              echo "Health check attempt $i failed with status $status. Retrying in 10 seconds..."
+              sleep 10
+            fi
+          done
+          echo "❌ Health check failed after deployment."
+          exit 1
+
+      - name: Handle Failure
+        if: failure()
+        run: |
+          echo "❌ Deployment or health check failed for ${{ matrix.environment }}."
+          exit 1
