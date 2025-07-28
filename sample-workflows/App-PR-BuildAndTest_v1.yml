@@ -1,0 +1,104 @@
+name: Build and Test .NET 8 Isolated Azure Function App on PR
+
+on:
+  pull_request:
+    branches:
+      - '*'
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: xyz-runner
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Find .NET 8 Isolated Azure Function App projects
+        id: find_projects
+        run: |
+          echo "Searching for .NET 8 Isolated Azure Function App projects..."
+          found_projects=()
+          while IFS= read -r csproj; do
+            if grep -q '<AzureFunctionsVersion>v4</AzureFunctionsVersion>' "$csproj" && \
+               grep -q '<OutputType>Exe</OutputType>' "$csproj" && \
+               grep -q '<TargetFramework>net8.0</TargetFramework>' "$csproj"; then
+              found_projects+=("$csproj")
+            fi
+          done < <(find . -name '*.csproj')
+          if [ ${#found_projects[@]} -eq 0 ]; then
+            echo "found_projects=" >> $GITHUB_OUTPUT
+          else
+            joined=$(IFS=, ; echo "${found_projects[*]}")
+            echo "found_projects=$joined" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fail if no Azure Function App projects found
+        if: ${{ steps.find_projects.outputs.found_projects == '' }}
+        run: |
+          echo "❌ No .NET 8 Isolated Azure Function App projects found. Please check your repository."
+          exit 1
+
+      - name: Restore and Build Azure Function App(s)
+        if: ${{ steps.find_projects.outputs.found_projects != '' }}
+        run: |
+          IFS=',' read -ra projects <<< "${{ steps.find_projects.outputs.found_projects }}"
+          for proj in "${projects[@]}"; do
+            echo "Restoring $proj"
+            dotnet restore "$proj"
+            echo "Building $proj"
+            dotnet build "$proj" --configuration Release --no-restore -warnaserror
+          done
+
+      - name: Run tests for Azure Function App(s)
+        if: ${{ steps.find_projects.outputs.found_projects != '' }}
+        run: |
+          IFS=',' read -ra projects <<< "${{ steps.find_projects.outputs.found_projects }}"
+          for proj in "${projects[@]}"; do
+            proj_dir=$(dirname "$proj")
+            # Find test projects in the repo that reference the function app project
+            test_projects=$(grep -rl "<ProjectReference Include=.*$(basename "$proj")" . --include '*Test*.csproj' || true)
+            if [ -z "$test_projects" ]; then
+              # Fallback: find any test projects in the repo
+              test_projects=$(find . -type f -name '*Test*.csproj')
+            fi
+            if [ -z "$test_projects" ]; then
+              echo "⚠️ No test projects found for $proj"
+            else
+              for test_proj in $test_projects; do
+                echo "Testing $test_proj"
+                dotnet test "$test_proj" --configuration Release --no-build --verbosity minimal --logger trx
+              done
+            fi
+          done
+
+      - name: Validate Azure Functions host.json
+        if: ${{ steps.find_projects.outputs.found_projects != '' }}
+        run: |
+          IFS=',' read -ra projects <<< "${{ steps.find_projects.outputs.found_projects }}"
+          for proj in "${projects[@]}"; do
+            proj_dir=$(dirname "$proj")
+            if [ -f "$proj_dir/host.json" ]; then
+              echo "Validating host.json in $proj_dir"
+              if ! jq . "$proj_dir/host.json" > /dev/null 2>&1; then
+                echo "Invalid host.json in $proj_dir"
+                exit 1
+              fi
+            else
+              echo "⚠️ No host.json found in $proj_dir"
+            fi
+          done
+
+      - name: List Azure Function App project(s) found
+        if: ${{ steps.find_projects.outputs.found_projects != '' }}
+        run: |
+          IFS=',' read -ra projects <<< "${{ steps.find_projects.outputs.found_projects }}"
+          echo "Azure Function App projects detected:"
+          for proj in "${projects[@]}"; do
+            echo " - $proj"
+          done

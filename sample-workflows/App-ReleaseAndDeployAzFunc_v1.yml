@@ -1,0 +1,280 @@
+name: Build, Release, and Deploy .NET 8 Isolated Azure Function App
+
+on:
+  push:
+    branches:
+      - dev
+      - pre-release
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select environment to deploy'
+        required: true
+        type: choice
+        options:
+          - dev
+          - test
+          - stage
+          - prod
+          - pre-release
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  DOTNET_VERSION: '8.0.x'
+  PACKAGE_PATH: './publish_output'
+  HEALTH_CHECK_URL_DEV: 'https://dev-funcapp.azurewebsites.net/api/health'
+  HEALTH_CHECK_URL_TEST: 'https://test-funcapp.azurewebsites.net/api/health'
+  HEALTH_CHECK_URL_STAGE: 'https://stage-funcapp.azurewebsites.net/api/health'
+  HEALTH_CHECK_URL_PROD: 'https://prod-funcapp.azurewebsites.net/api/health'
+
+jobs:
+  build_and_package:
+    name: Build & Package
+    runs-on: xyz-runner
+    outputs:
+      environment: ${{ steps.set_env.outputs.environment }}
+      found_projects: ${{ steps.find_projects.outputs.found_projects }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Set Environment
+        id: set_env
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            if [[ "${{ github.ref }}" == "refs/heads/dev" ]]; then
+              echo "environment=dev" >> $GITHUB_OUTPUT
+            elif [[ "${{ github.ref }}" == "refs/heads/pre-release" ]]; then
+              echo "environment=pre-release" >> $GITHUB_OUTPUT
+            fi
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "environment=${{ github.event.inputs.environment }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Find Azure Function Projects
+        id: find_projects
+        run: |
+          found_projects=()
+          while IFS= read -r csproj; do
+            if grep -q '<AzureFunctionsVersion>v4</AzureFunctionsVersion>' "$csproj" && \
+               grep -q '<OutputType>Exe</OutputType>' "$csproj" && \
+               grep -q '<TargetFramework>net8.0</TargetFramework>' "$csproj"; then
+              found_projects+=("$csproj")
+            fi
+          done < <(find . -name '*.csproj')
+          if [ ${#found_projects[@]} -eq 0 ]; then
+            echo "found_projects=" >> $GITHUB_OUTPUT
+          else
+            joined=$(IFS=, ; echo "${found_projects[*]}")
+            echo "found_projects=$joined" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Fail if No Function Projects
+        if: ${{ steps.find_projects.outputs.found_projects == '' }}
+        run: |
+          echo "❌ No .NET 8 Isolated Azure Function App projects found."
+          exit 1
+
+      - name: Restore & Build
+        if: ${{ steps.find_projects.outputs.found_projects != '' }}
+        run: |
+          IFS=',' read -ra projects <<< "${{ steps.find_projects.outputs.found_projects }}"
+          for proj in "${projects[@]}"; do
+            dotnet restore "$proj"
+            dotnet build "$proj" --configuration Release --no-restore -warnaserror
+          done
+
+      - name: Publish
+        if: ${{ steps.find_projects.outputs.found_projects != '' }}
+        run: |
+          rm -rf ${{ env.PACKAGE_PATH }}
+          mkdir -p ${{ env.PACKAGE_PATH }}
+          IFS=',' read -ra projects <<< "${{ steps.find_projects.outputs.found_projects }}"
+          for proj in "${projects[@]}"; do
+            proj_dir=$(dirname "$proj")
+            dotnet publish "$proj" --configuration Release --output "${{ env.PACKAGE_PATH }}/$(basename "$proj_dir")"
+          done
+
+  enforce_branch_env:
+    name: Enforce Branch/Env Rules
+    runs-on: xyz-runner
+    needs: build_and_package
+    if: ${{ always() }}
+    steps:
+      - name: Enforce dev branch to dev env only
+        if: |
+          (github.event_name == 'push' && github.ref == 'refs/heads/dev' && needs.build_and_package.outputs.environment != 'dev') ||
+          (github.event_name == 'workflow_dispatch' && needs.build_and_package.outputs.environment == 'dev' && github.ref != 'refs/heads/dev')
+        run: |
+          echo "❌ Dev branch can only deploy to Dev environment."
+          exit 1
+
+      - name: Enforce pre-release branch to test/stage/prod only
+        if: |
+          (github.event_name == 'push' && github.ref == 'refs/heads/pre-release' && (needs.build_and_package.outputs.environment == 'dev' || needs.build_and_package.outputs.environment == 'pre-release')) ||
+          (github.event_name == 'workflow_dispatch' && needs.build_and_package.outputs.environment != 'dev' && github.ref != 'refs/heads/pre-release' && needs.build_and_package.outputs.environment != 'pre-release')
+        run: |
+          echo "❌ Only pre-release branch can deploy to Test, Stage, or Prod."
+          exit 1
+
+  deploy:
+    name: Deploy to Azure Function App
+    needs: [build_and_package, enforce_branch_env]
+    if: ${{ needs.build_and_package.outputs.found_projects != '' && needs.build_and_package.outputs.environment != 'prod' && needs.build_and_package.result == 'success' }}
+    runs-on: xyz-runner
+    environment:
+      name: ${{ needs.build_and_package.outputs.environment }}
+      url: ${{ 
+        needs.build_and_package.outputs.environment == 'dev' && env.HEALTH_CHECK_URL_DEV ||
+        needs.build_and_package.outputs.environment == 'test' && env.HEALTH_CHECK_URL_TEST ||
+        needs.build_and_package.outputs.environment == 'stage' && env.HEALTH_CHECK_URL_STAGE
+      }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v1
+        with:
+          client-id: ${{ 
+            needs.build_and_package.outputs.environment == 'dev' && secrets.AZURE_CLIENT_ID_DEV ||
+            needs.build_and_package.outputs.environment == 'test' && secrets.AZURE_CLIENT_ID_TEST ||
+            needs.build_and_package.outputs.environment == 'stage' && secrets.AZURE_CLIENT_ID_STAGE
+          }}
+          tenant-id: ${{ 
+            needs.build_and_package.outputs.environment == 'dev' && secrets.AZURE_TENANT_ID_DEV ||
+            needs.build_and_package.outputs.environment == 'test' && secrets.AZURE_TENANT_ID_TEST ||
+            needs.build_and_package.outputs.environment == 'stage' && secrets.AZURE_TENANT_ID_STAGE
+          }}
+          subscription-id: ${{ 
+            needs.build_and_package.outputs.environment == 'dev' && secrets.AZURE_SUBSCRIPTION_ID_DEV ||
+            needs.build_and_package.outputs.environment == 'test' && secrets.AZURE_SUBSCRIPTION_ID_TEST ||
+            needs.build_and_package.outputs.environment == 'stage' && secrets.AZURE_SUBSCRIPTION_ID_STAGE
+          }}
+
+      - name: Deploy Function App
+        uses: azure/functions-action@v1
+        with:
+          app-name: ${{ 
+            needs.build_and_package.outputs.environment == 'dev' && secrets.AZURE_FUNCTIONAPP_NAME_DEV ||
+            needs.build_and_package.outputs.environment == 'test' && secrets.AZURE_FUNCTIONAPP_NAME_TEST ||
+            needs.build_and_package.outputs.environment == 'stage' && secrets.AZURE_FUNCTIONAPP_NAME_STAGE
+          }}
+          package: ${{ env.PACKAGE_PATH }}
+          publish-profile: ${{ 
+            needs.build_and_package.outputs.environment == 'dev' && secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE_DEV ||
+            needs.build_and_package.outputs.environment == 'test' && secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE_TEST ||
+            needs.build_and_package.outputs.environment == 'stage' && secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE_STAGE
+          }}
+
+      - name: Health Check
+        env:
+          HEALTH_CHECK_URL: ${{ 
+            needs.build_and_package.outputs.environment == 'dev' && env.HEALTH_CHECK_URL_DEV ||
+            needs.build_and_package.outputs.environment == 'test' && env.HEALTH_CHECK_URL_TEST ||
+            needs.build_and_package.outputs.environment == 'stage' && env.HEALTH_CHECK_URL_STAGE
+          }}
+        run: |
+          for i in {1..10}; do
+            status=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_CHECK_URL" || echo "000")
+            if [ "$status" = "200" ]; then
+              echo "✅ Health check passed."
+              exit 0
+            else
+              echo "Health check attempt $i failed with status $status. Retrying in 10 seconds..."
+              sleep 10
+            fi
+          done
+          echo "❌ Health check failed after deployment."
+          exit 1
+
+      - name: Handle Failure
+        if: failure()
+        run: |
+          echo "❌ Deployment or health check failed for ${{ needs.build_and_package.outputs.environment }}."
+          exit 1
+
+  prod_approval_and_deploy:
+    name: Prod Approval & Deploy
+    needs: [build_and_package, enforce_branch_env]
+    if: ${{ needs.build_and_package.outputs.found_projects != '' && needs.build_and_package.outputs.environment == 'prod' && needs.build_and_package.result == 'success' }}
+    runs-on: xyz-runner
+    environment:
+      name: prod
+      url: ${{ env.HEALTH_CHECK_URL_PROD }}
+      reviewers: [approver1, approver2, approver3]
+    timeout-minutes: 180
+    steps:
+      - name: Await Approval
+        uses: trstringer/manual-approval@v1
+        with:
+          approvers: approver1,approver2,approver3
+          minimum-approvals: 1
+          timeout-minutes: 180
+          issue-title: "Prod Deployment Approval Required"
+          issue-body: "Please approve the production deployment for this workflow run."
+          exclude-workflow-initiator-as-approver: false
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID_PROD }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID_PROD }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID_PROD }}
+
+      - name: Deploy Function App (Prod)
+        uses: azure/functions-action@v1
+        with:
+          app-name: ${{ secrets.AZURE_FUNCTIONAPP_NAME_PROD }}
+          package: ${{ env.PACKAGE_PATH }}
+          publish-profile: ${{ secrets.AZURE_FUNCTIONAPP_PUBLISH_PROFILE_PROD }}
+
+      - name: Health Check (Prod)
+        env:
+          HEALTH_CHECK_URL: ${{ env.HEALTH_CHECK_URL_PROD }}
+        run: |
+          for i in {1..10}; do
+            status=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_CHECK_URL" || echo "000")
+            if [ "$status" = "200" ]; then
+              echo "✅ Health check passed."
+              exit 0
+            else
+              echo "Health check attempt $i failed with status $status. Retrying in 10 seconds..."
+              sleep 10
+            fi
+          done
+          echo "❌ Health check failed after deployment."
+          exit 1
+
+      - name: Handle Failure (Prod)
+        if: failure()
+        run: |
+          echo "❌ Deployment or health check failed for Prod."
+          exit 1
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
